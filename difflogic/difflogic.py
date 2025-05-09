@@ -20,6 +20,7 @@ class LogicLayer(torch.nn.Module):
             grad_factor: float = 1.,
             implementation: str = None,
             connections: str = 'random',
+            restricted_gates: list = None
     ):
         """
         :param in_dim:      input dimensionality of the layer
@@ -35,6 +36,7 @@ class LogicLayer(torch.nn.Module):
         self.out_dim = out_dim
         self.device = device
         self.grad_factor = grad_factor
+        self.restricted_gates = restricted_gates if restricted_gates is not None else list(range(16))
 
         """
         The CUDA implementation is the fast implementation. As the name implies, the cuda implementation is only 
@@ -50,7 +52,7 @@ class LogicLayer(torch.nn.Module):
         assert self.implementation in ['cuda', 'python'], self.implementation
 
         self.connections = connections
-        assert self.connections in ['random', 'unique'], self.connections
+        assert self.connections in ['random', 'unique', 'paired'], self.connections
         self.indices = self.get_connections(self.connections, device)
 
         if self.implementation == 'cuda':
@@ -95,16 +97,14 @@ class LogicLayer(torch.nn.Module):
         assert x.shape[-1] == self.in_dim, (x[0].shape[-1], self.in_dim)
 
         if self.indices[0].dtype == torch.int64 or self.indices[1].dtype == torch.int64:
-            print(self.indices[0].dtype, self.indices[1].dtype)
             self.indices = self.indices[0].long(), self.indices[1].long()
-            print(self.indices[0].dtype, self.indices[1].dtype)
 
         a, b = x[..., self.indices[0]], x[..., self.indices[1]]
         if self.training:
-            x = bin_op_s(a, b, torch.nn.functional.softmax(self.weights, dim=-1))
+            x = bin_op_s(a, b, torch.nn.functional.softmax(self.weights, dim=-1), self.restricted_gates)
         else:
             weights = torch.nn.functional.one_hot(self.weights.argmax(-1), 16).to(torch.float32)
-            x = bin_op_s(a, b, weights)
+            x = bin_op_s(a, b, weights, self.restricted_gates)
         return x
 
     def forward_cuda(self, x):
@@ -170,7 +170,217 @@ class LogicLayer(torch.nn.Module):
 
 
 ########################################################################################################################
+class InvLogicLayer(LogicLayer):
+    def __init__(
+            self,
+            in_dim: int,
+            out_dim: int,
+            device: str = 'cuda',
+            grad_factor: float = 1.,
+            implementation: str = None,
+            connections: str = 'paired',
+            restricted_gates: list = None
+    ):
+        """
+        :param in_dim:      input dimensionality of the layer
+        :param out_dim:     output dimensionality of the layer
+        :param device:      device (options: 'cuda' / 'cpu')
+        :param grad_factor: for deep models (>6 layers), the grad_factor should be increased (e.g., 2) to avoid vanishing gradients
+        :param implementation: implementation to use (options: 'cuda' / 'python'). cuda is around 100x faster than python
+        :param connections: method for initializing the connectivity of the logic gate net
+        :param restricted_gates: list of allowed gate types
+        """
+        super().__init__(in_dim, out_dim, device, grad_factor, implementation, connections)
+        self.restricted_gates = restricted_gates if restricted_gates is not None else [10, 12]
+        self.weights = torch.nn.parameter.Parameter(torch.randn(out_dim, len(self.restricted_gates), device=device))
 
+    def forward_python(self, x):
+        assert x.shape[-1] == self.in_dim, (x[0].shape[-1], self.in_dim)
+
+        if self.indices[0].dtype == torch.int64 or self.indices[1].dtype == torch.int64:
+            self.indices = self.indices[0].long(), self.indices[1].long()
+
+        a, b = x[..., self.indices[0]], x[..., self.indices[1]]
+        if self.training:
+            x = bin_op_s(a, b, torch.nn.functional.softmax(self.weights, dim=-1), self.restricted_gates)
+        else:
+            weights = torch.nn.functional.one_hot(self.weights.argmax(-1), len(self.restricted_gates)).to(torch.float32)
+            x = bin_op_s(a, b, weights, self.restricted_gates)
+        return x
+
+    def forward_cuda(self, x):
+        if self.training:
+            assert x.device.type == 'cuda', x.device
+        assert x.ndim == 2, x.ndim
+
+        x = x.transpose(0, 1)
+        x = x.contiguous()
+
+        assert x.shape[0] == self.in_dim, (x.shape, self.in_dim)
+
+        a, b = self.indices
+
+        if self.training:
+            w = torch.nn.functional.softmax(self.weights, dim=-1).to(x.dtype)
+            return LogicLayerCudaFunction.apply(
+                x, a, b, w, self.given_x_indices_of_y_start, self.given_x_indices_of_y, self.restricted_gates
+            ).transpose(0, 1)
+        else:
+            w = torch.nn.functional.one_hot(self.weights.argmax(-1), len(self.restricted_gates)).to(x.dtype)
+            with torch.no_grad():
+                return LogicLayerCudaFunction.apply(
+                    x, a, b, w, self.given_x_indices_of_y_start, self.given_x_indices_of_y, self.restricted_gates
+                ).transpose(0, 1)
+
+    # Attach everything to itself
+    def get_connections(self, connections, device='cuda'):
+        assert connections == 'paired', 'InvLogicLayer only supports paired connections.'
+        assert self.in_dim == self.out_dim, 'Input and output dimensions must be the same for self-pairing.'
+
+        # Pair each input with itself
+        a = torch.arange(self.in_dim, device=device)
+        b = a.clone()  # Create an identical tensor for pairing
+
+        return a, b
+    
+########################################################################################################################
+
+class PairedLogicLayer(LogicLayer):
+    def __init__(
+            self,
+            in_dim: int,
+            out_dim: int,
+            device: str = 'cuda',
+            grad_factor: float = 1.,
+            implementation: str = None,
+            connections: str = 'paired',
+            restricted_gates: list = None
+    ):
+        """
+        :param in_dim:      input dimensionality of the layer
+        :param out_dim:     output dimensionality of the layer
+        :param device:      device (options: 'cuda' / 'cpu')
+        :param grad_factor: for deep models (>6 layers), the grad_factor should be increased (e.g., 2) to avoid vanishing gradients
+        :param implementation: implementation to use (options: 'cuda' / 'python'). cuda is around 100x faster than python
+        :param connections: method for initializing the connectivity of the logic gate net
+        :param restricted_gates: list of allowed gate types
+        """
+        super().__init__(in_dim, out_dim, device, grad_factor, implementation, connections)
+        self.restricted_gates = restricted_gates if restricted_gates is not None else [10, 12]
+        self.weights = torch.nn.parameter.Parameter(torch.randn(out_dim, len(self.restricted_gates), device=device))
+
+    def forward_python(self, x):
+        assert x.shape[-1] == self.in_dim, (x[0].shape[-1], self.in_dim)
+
+        if self.indices[0].dtype == torch.int64 or self.indices[1].dtype == torch.int64:
+            self.indices = self.indices[0].long(), self.indices[1].long()
+
+        a, b = x[..., self.indices[0]], x[..., self.indices[1]]
+        if self.training:
+            x = bin_op_s(a, b, torch.nn.functional.softmax(self.weights, dim=-1), self.restricted_gates)
+        else:
+            weights = torch.nn.functional.one_hot(self.weights.argmax(-1), len(self.restricted_gates)).to(torch.float32)
+            x = bin_op_s(a, b, weights, self.restricted_gates)
+        return x
+
+    def forward_cuda(self, x):
+        if self.training:
+            assert x.device.type == 'cuda', x.device
+        assert x.ndim == 2, x.ndim
+
+        x = x.transpose(0, 1)
+        x = x.contiguous()
+
+        assert x.shape[0] == self.in_dim, (x.shape, self.in_dim)
+
+        a, b = self.indices
+
+        if self.training:
+            w = torch.nn.functional.softmax(self.weights, dim=-1).to(x.dtype)
+            return LogicLayerCudaFunction.apply(
+                x, a, b, w, self.given_x_indices_of_y_start, self.given_x_indices_of_y, self.restricted_gates
+            ).transpose(0, 1)
+        else:
+            w = torch.nn.functional.one_hot(self.weights.argmax(-1), len(self.restricted_gates)).to(x.dtype)
+            with torch.no_grad():
+                return LogicLayerCudaFunction.apply(
+                    x, a, b, w, self.given_x_indices_of_y_start, self.given_x_indices_of_y, self.restricted_gates
+                ).transpose(0, 1)
+
+    def get_connections(self, connections, device='cuda'):
+        assert connections == 'paired', 'PairedLogicLayer only supports paired connections.'
+        assert self.in_dim % 2 == 0, 'Input dimension must be even for paired connections.'
+        half_in_dim = self.in_dim // 2
+        a = torch.arange(half_in_dim, device=device)
+        b = a + half_in_dim
+        return a, b
+
+
+########################################################################################################################
+
+class RestrictedLogicLayer(LogicLayer):
+    def __init__(
+            self,
+            in_dim: int,
+            out_dim: int,
+            device: str = 'cuda',
+            grad_factor: float = 1.,
+            implementation: str = None,
+            connections: str = 'random',
+            restricted_gates: list = None
+    ):
+        """
+        :param in_dim:      input dimensionality of the layer
+        :param out_dim:     output dimensionality of the layer
+        :param device:      device (options: 'cuda' / 'cpu')
+        :param grad_factor: for deep models (>6 layers), the grad_factor should be increased (e.g., 2) to avoid vanishing gradients
+        :param implementation: implementation to use (options: 'cuda' / 'python'). cuda is around 100x faster than python
+        :param connections: method for initializing the connectivity of the logic gate net
+        :param restricted_gates: list of allowed gate types
+        """
+        super().__init__(in_dim, out_dim, device, grad_factor, implementation, connections)
+        self.restricted_gates = restricted_gates if restricted_gates is not None else [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        self.weights = torch.nn.parameter.Parameter(torch.randn(out_dim, len(self.restricted_gates), device=device))
+
+    def forward_python(self, x):
+        assert x.shape[-1] == self.in_dim, (x[0].shape[-1], self.in_dim)
+
+        if self.indices[0].dtype == torch.int64 or self.indices[1].dtype == torch.int64:
+            self.indices = self.indices[0].long(), self.indices[1].long()
+
+        a, b = x[..., self.indices[0]], x[..., self.indices[1]]
+        if self.training:
+            x = bin_op_s(a, b, torch.nn.functional.softmax(self.weights, dim=-1), self.restricted_gates)
+        else:
+            weights = torch.nn.functional.one_hot(self.weights.argmax(-1), len(self.restricted_gates)).to(torch.float32)
+            x = bin_op_s(a, b, weights, self.restricted_gates)
+        return x
+
+    def forward_cuda(self, x):
+        if self.training:
+            assert x.device.type == 'cuda', x.device
+        assert x.ndim == 2, x.ndim
+
+        x = x.transpose(0, 1)
+        x = x.contiguous()
+
+        assert x.shape[0] == self.in_dim, (x.shape, self.in_dim)
+
+        a, b = self.indices
+
+        if self.training:
+            w = torch.nn.functional.softmax(self.weights, dim=-1).to(x.dtype)
+            return LogicLayerCudaFunction.apply(
+                x, a, b, w, self.given_x_indices_of_y_start, self.given_x_indices_of_y, self.restricted_gates
+            ).transpose(0, 1)
+        else:
+            w = torch.nn.functional.one_hot(self.weights.argmax(-1), len(self.restricted_gates)).to(x.dtype)
+            with torch.no_grad():
+                return LogicLayerCudaFunction.apply(
+                    x, a, b, w, self.given_x_indices_of_y_start, self.given_x_indices_of_y, self.restricted_gates
+                ).transpose(0, 1)
+
+########################################################################################################################
 
 class GroupSum(torch.nn.Module):
     """

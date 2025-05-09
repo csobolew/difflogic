@@ -62,11 +62,11 @@ def bin_op(a, b, i):
         return torch.ones_like(a)
 
 
-def bin_op_s(a, b, i_s):
+def bin_op_s(a, b, i_s, restricted_gates):
     r = torch.zeros_like(a)
-    for i in range(16):
-        u = bin_op(a, b, i)
-        r = r + i_s[..., i] * u
+    for idx, gate in enumerate(restricted_gates):
+        u = bin_op(a, b, gate)
+        r = r + i_s[..., idx] * u
     return r
 
 
